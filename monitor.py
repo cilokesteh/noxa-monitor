@@ -368,8 +368,8 @@ def format_report(screen, pool_addr):
 ➰ VOL:  {fnum(vol)} (24h)
 ➰ 1H:   {buy_sell}
 ➰ HLD:  {holders or '?'}
-➰ P:    {sh(addr)} 🦄
-➰ DEV:  {sh(owner)}
+➰ P:    <code>{sh(addr)}</code> 🦄
+➰ DEV:  <code>{sh(owner)}</code>
 
 🔗 <b>Socials</b>
 ➰ {soc_line}
@@ -377,9 +377,10 @@ def format_report(screen, pool_addr):
 ✅ Audit {'🟩🟩' if verified else '🟥'}
 ✅ DEX [PAID] [info]
 
-<b>{addr}</b>
+<b>Contract</b>
+<code>{addr}</code>
 
-⚠️ <i>DYOR — bukan saran finansial.</i>"""
+⚠️ <i>Long-press address untuk copy</i>"""
 
     # append original risk flags if present
     if screen.get("red_flags") or screen.get("green_flags"):
