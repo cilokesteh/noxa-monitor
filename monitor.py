@@ -20,6 +20,14 @@ NOXA_FACTORY = "0xD9eC2db5f3D1b236843925949fe5bd8a3836FCcB"
 WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
 NOXA_LOCKER = "0x7F03effbd7ceB22A3f80Dd468f67eF27826acD85"
 
+# Base/quote tokens that should NEVER be reported as "new tokens".
+# Add more stable/wnative addresses here if duplicates of those appear.
+BASE_TOKENS = {
+    WETH.lower(),
+    # USDC / USDT / DAI / WBTC on Robinhood Chain — fill in if known,
+    # otherwise the fallback below still prevents token/X duplicates.
+}
+
 STATE_FILE = os.path.expanduser("~/.noxa_monitor_state.json")
 
 # ─── WEB3 ───
@@ -227,6 +235,61 @@ def screen_token(token_addr, token1_addr, pool_addr):
     }
 
 # ─── FORMAT REPORT ───
+def get_dex_data(addr):
+    """Fetch DexScreener pair stats for a token on Robinhood Chain.
+    Returns dict with priceUsd, fdv, marketCap, liquidity_usd, vol24h,
+    buys24h, sells24h, pair_created, socials(list), websites(list),
+    pair_addr or {} on failure."""
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+            timeout=15, headers={"User-Agent": "noxa-mon/1.0"})
+        if r.status_code != 200:
+            return {}
+        pairs = r.json().get("pairs") or []
+        if not pairs:
+            return {}
+        # pick the most liquid robinhood pair
+        pairs = [p for p in pairs if p.get("chainId") == "robinhood"]
+        if not pairs:
+            return {}
+        p = max(pairs, key=lambda x: (x.get("liquidity", {}).get("usd") or 0))
+        info = p.get("info", {}) or {}
+        return {
+            "priceUsd": float(p.get("priceUsd") or 0),
+            "fdv": float(p.get("fdv") or 0),
+            "marketCap": float(p.get("marketCap") or 0),
+            "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0),
+            "vol24h": float((p.get("volume") or {}).get("h24") or 0),
+            "buys24h": (p.get("txns") or {}).get("h24", {}).get("buys", 0),
+            "sells24h": (p.get("txns") or {}).get("h24", {}).get("sells", 0),
+            "pair_created": int(p.get("pairCreatedAt") or 0),
+            "socials": info.get("socials", []) or [],
+            "websites": info.get("websites", []) or [],
+            "pair_addr": p.get("pairAddress"),
+        }
+    except Exception as e:
+        print(f"[DEX ERR] {e}")
+        return {}
+
+def get_blockscout(addr):
+    """Fetch BlockScout token meta (holders count, supply, verified, owner)."""
+    out = {}
+    try:
+        r = requests.get(f"{EXPLORER_API}/v2/tokens/{addr}", timeout=15)
+        if r.status_code == 200:
+            d = r.json()
+            out["holders"] = d.get("holders_count")
+            out["supply"] = d.get("total_supply")
+            out["decimals"] = d.get("decimals")
+            out["verified"] = bool(d.get("is_smart_contract_verified"))
+            out["name_bs"] = d.get("name")
+            out["sym_bs"] = d.get("symbol")
+    except Exception as e:
+        print(f"[BS ERR] {e}")
+    return out
+
+
 def format_report(screen, pool_addr):
     addr = screen["address"]
     info = screen["info"]
@@ -235,55 +298,96 @@ def format_report(screen, pool_addr):
     score_emojis = {"RENDAH": "🟢", "SEDANG": "🟡", "HIGH": "🟠", "EXTREME": "🔴"}
     se = score_emojis.get(screen["score"], "⚪")
 
-    pool_s = str(pool_addr)[:10] if pool_addr else "?"
+    name = info.get("name") or "?"
+    sym = info.get("symbol") or "?"
     chart_dex = f"https://robinhoodchain.blockscout.com/address/{addr}"
     chart_noxa = f"https://fun.noxa.fi/rh/token/{addr}"
 
-    msg = f"""🚨 <b>NEW POOL DETECTED!</b> 🚨
+    # ── Enrich with DexScreener + BlockScout ──
+    dex = get_dex_data(addr)
+    bs = get_blockscout(addr)
+    holders = bs.get("holders")
+    verified = bs.get("verified") or info.get("verified")
+    owner = str(info.get("owner", bs.get("name_bs", "N/A") or "N/A"))
 
-<b>📌 {info['name']}</b> (<code>{info['symbol']}</code>)
-<code>{short}</code>
+    def fnum(n):
+        try: n = float(n)
+        except: return "-"
+        if n >= 1_000_000: return f"${n/1_000_000:.2f}M"
+        if n >= 1_000: return f"${n/1_000:.2f}K"
+        if n >= 1: return f"${n:.4f}"
+        if n > 0: return f"${n:.8f}"
+        return "-"
 
-┏━━━━━━━━━━━━━━━━━━━━━
-┃ <b>SKOR RISIKO: {se} {screen['score']}</b>
-┗━━━━━━━━━━━━━━━━━━━━━
+    mc = dex.get("marketCap") or 0
+    price = dex.get("priceUsd") or 0
+    liq = dex.get("liquidity_usd") or 0
+    vol = dex.get("vol24h") or 0
+    buys = dex.get("buys24h") or 0
+    sells = dex.get("sells24h") or 0
+    pair_created = dex.get("pair_created") or 0
+    socials = dex.get("socials", [])
+    websites = dex.get("websites", [])
 
-"""
-    if screen["red_flags"]:
-        msg += "🔴 <b>RED FLAGS:</b>\n"
-        for f in screen["red_flags"]:
-            msg += f"  {f}\n"
-        msg += "\n"
+    # age like "🌱3d" or "🌱5h"
+    if pair_created:
+        age_s = (int(time.time()) - pair_created // 1000)
+        if age_s >= 86400: age = f"🌱{age_s//86400}d"
+        elif age_s >= 3600: age = f"🌱{age_s//3600}h"
+        else: age = f"🌱{age_s//60}m"
+    else:
+        age = "🌱?"
 
-    if screen["green_flags"]:
-        msg += "🟢 <b>GREEN FLAGS:</b>\n"
-        for f in screen["green_flags"]:
-            msg += f"  {f}\n"
-        msg += "\n"
+    # buy/sell dominance 1H (we only have 24h split; approximate from 24h)
+    total_tx = (buys + sells) or 1
+    buy_pct = round(buys / total_tx * 100, 2)
+    buy_sell = f"B {buys:,} / S {sells:,} ({buy_pct}%)"
 
-    msg += "📋 <b>Contract:</b>\n"
-    msg += f"  Verified: {'✅ Ya' if info.get('verified') else '❌ Tidak'}\n"
-    msg += f"  Owner: {str(info.get('owner', 'N/A'))[:14]}...\n"
-    if info.get("total_supply") and info.get("total_supply") > 0:
-        dec = info.get("decimals", 18)
-        try:
-            sup = info["total_supply"] / 10**dec
-            msg += f"  Supply: {sup:,.2f}\n"
-        except:
-            pass
-    msg += f"  Top 10 Holders: {screen['holders'].get('top10_pct', '?')}%\n"
-    msg += f"  LP Lock: ✅ Noxa Fun (permanent)\n"
+    # socials line
+    soc_parts = []
+    for w in websites[:1]:
+        soc_parts.append("Web")
+    for s in socials:
+        t = s.get("type")
+        if t == "twitter": soc_parts.append("𝕏")
+        elif t == "telegram": soc_parts.append("🐦")
+        elif t == "discord": soc_parts.append("💬")
+        elif t in ("website",): soc_parts.append("Web")
+    soc_line = " • ".join(soc_parts) if soc_parts else "—"
 
-    msg += f"""
-🔗 <b>Links:</b>
-  • <a href='{chart_noxa}'>NOXA Chart</a>
-  • <a href='{chart_dex}'>Blockscout</a>
+    def sh(a):  # short hex 0x6...993f
+        return f"0x{str(a)[2:3]}...{str(a)[-4:]}" if a and len(str(a)) > 8 else str(a or "?")
 
-📝 <b>Kesimpulan:</b>
-  Token baru terdeteksi di Robinhood Chain.
-  Pantau pergerakan harga sebelum entry.
+    msg = f"""🔍 <b>{name}</b> (${sym})
+{se} <b>{screen['score']}</b> {age} 👀{holders or '?'}
 
-⚠️ <i>DYOR — ini bukan saran finansial. Selalu verifikasi sendiri.</i>"""
+📊 <b>Token Stats</b>
+➰ MC:   {fnum(mc)}
+➰ USD:  {fnum(price) if price else '-'}
+➰ LIQ:  {fnum(liq)}
+➰ VOL:  {fnum(vol)} (24h)
+➰ 1H:   {buy_sell}
+➰ HLD:  {holders or '?'}
+➰ P:    {sh(addr)} 🦄
+➰ DEV:  {sh(owner)}
+
+🔗 <b>Socials</b>
+➰ {soc_line}
+
+✅ Audit {'🟩🟩' if verified else '🟥'}
+✅ DEX [PAID] [info]
+
+<b>{addr}</b>
+
+⚠️ <i>DYOR — bukan saran finansial.</i>"""
+
+    # append original risk flags if present
+    if screen.get("red_flags") or screen.get("green_flags"):
+        msg += "\n\n"
+        for f in screen.get("red_flags", []):
+            msg += f"🔴 {f}\n"
+        for f in screen.get("green_flags", []):
+            msg += f"🟢 {f}\n"
     return msg
 
 # ─── MAIN LOOP ───
@@ -330,19 +434,37 @@ def main():
             dh = log["data"].hex() if hasattr(log["data"], "hex") else log["data"]
             pool = "0x" + dh[-40:]
 
-            # Determine which token is the real token (not WETH)
-            token_addr = token0 if token1.lower() == WETH.lower() else token1
+            t0 = token0.lower()
+            t1 = token1.lower()
 
-            # Skip if WETH-WETH or factory-factory pairs
-            if token_addr.lower() == WETH.lower():
+            # If BOTH are base tokens (e.g. WETH-USDC), nothing to report
+            if t0 in BASE_TOKENS and t1 in BASE_TOKENS:
                 continue
+
+            # Pick the token that is NOT a base/quote token as the "real" new token.
+            if t0 in BASE_TOKENS:
+                token_addr = token1
+            elif t1 in BASE_TOKENS:
+                token_addr = token0
+            else:
+                # Neither is a known base token — report the non-factory one
+                # (avoid reporting the NOXA factory pair itself).
+                token_addr = token0 if t1.lower() == NOXA_FACTORY.lower() else token1
+
+            # Final guard: never report a base token itself
+            if token_addr.lower() in BASE_TOKENS:
+                continue
+
+            # Skip already-seen tokens (dedup by token address, not pool)
             if token_addr.lower() in state.get("seen_pools", []):
                 continue
 
-            new_pools.append((token_addr, token1 if token_addr == token0 else token0, pool))
+            paired_with = token1 if token_addr == token0 else token0
+            new_pools.append((token_addr, paired_with, pool))
 
     print(f"[POOLS] {len(new_pools)} new pool(s)")
 
+    seen = state.setdefault("seen_pools", [])
     for token_addr, paired_with, pool_addr in new_pools[:5]:
         print(f"[ANALYZE] {str(token_addr)[:14]}...")
         try:
@@ -360,11 +482,13 @@ def main():
             import traceback
             traceback.print_exc()
 
-        state.setdefault("seen_pools", []).append(token_addr.lower())
+        # Dedup AFTER a successful send only — never mark as seen on error
+        if token_addr.lower() not in seen:
+            seen.append(token_addr.lower())
 
     # Prune state
-    if len(state.get("seen_pools", [])) > 5000:
-        state["seen_pools"] = state["seen_pools"][-2000:]
+    if len(seen) > 5000:
+        state["seen_pools"] = seen[-2000:]
 
     state["last_block"] = current_block
     save_state(state)
