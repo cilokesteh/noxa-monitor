@@ -295,7 +295,7 @@ def main():
     print(f"[START] Block: {current_block} | Last checked: {last_block}")
 
     # If first run or behind, use smaller range
-    from_block = max(last_block, current_block - 500) if last_block else current_block - 200
+    from_block = max(last_block, current_block - 500) if last_block else current_block - 500
     if from_block >= current_block:
         print("[SKIP] No new blocks")
         return
@@ -344,16 +344,21 @@ def main():
     print(f"[POOLS] {len(new_pools)} new pool(s)")
 
     for token_addr, paired_with, pool_addr in new_pools[:5]:
-        print(f"[ANALYZE] {str(token_addr)[:10]}...")
+        print(f"[ANALYZE] {str(token_addr)[:14]}...")
         try:
             screen = screen_token(token_addr, paired_with, pool_addr)
             if screen is None:
+                print(f"[SKIP] {str(token_addr)[:14]}... (WETH pair)")
                 continue
             msg = format_report(screen, pool_addr)
-            tg_send(msg)
+            print(f"[TG SEND] {screen.get('info',{}).get('symbol','?')}")
+            result = tg_send(msg)
+            print(f"[TG] {result}")
             time.sleep(3)
         except Exception as e:
-            print(f"[ERR] {str(token_addr)[:10]}...: {e}")
+            print(f"[ERR] {str(token_addr)[:14]}...: {e}")
+            import traceback
+            traceback.print_exc()
 
         state.setdefault("seen_pools", []).append(token_addr.lower())
 
